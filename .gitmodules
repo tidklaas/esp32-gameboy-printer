@@ -1,0 +1,3 @@
+[submodule "components/libesphttpd"]
+	path = components/libesphttpd
+	url = https://github.com/chmorgan/libesphttpd.git

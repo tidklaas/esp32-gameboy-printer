@@ -1,0 +1,4 @@
+body {margin: 5% auto; background: #f2f2f2; color: #444444; font-family: 'Courier New'; font-size: 14px; line-height: 1.6; text-shadow: 0 1px 0 #ffffff; max-width: 73%;}
+h1, h2 {line-height: 1.3;}
+button {background-color: #444444; border: none; color: white; padding: 15px 32px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin-top: 10px; margin-bottom: 10px;}
+select { width: 240px; height: 34px; overflow: hidden; background: #ddd; border: 1px solid #ccc; margin-bottom: 15px;}
