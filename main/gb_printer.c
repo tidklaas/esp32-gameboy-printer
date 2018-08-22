@@ -82,10 +82,15 @@
 #define IMGDIR          "/img"
 #define IMGTMPL         "img%05d.png"
 #define IMG_WIDTH       160 // Images are always 160 pixels wide
-#define IMG_HIGHT       144 // Maximum image hight, may be less
+#define IMG_HEIGHT      144 // Maximum image height, may be less
 #define IMG_SIZE        5760
 #define MAX_DATA_SIZE   640
 #define PR_PARAM_SIZE   4
+#define PKT_RING_SIZE   4
+
+#define ARRAY_SIZE(x)   (sizeof(x) / sizeof(*(x)))
+#define likely(x)       __builtin_expect((x),1)
+#define unlikely(x)     __builtin_expect((x),0)
 
 #define STATUS_CHKSUM   (1u << 0)
 #define STATUS_BUSY     (1u << 1)
@@ -97,8 +102,7 @@
 #define STATUS_BATLOW   (1u << 7)
 
 enum pr_state {
-    state_ready = 0,
-    state_sync0,
+    state_sync0 = 0,
     state_sync1,
     state_cmd,
     state_compr,
@@ -109,7 +113,7 @@ enum pr_state {
     state_chk_high,
     state_ack,
     state_status,
-    state_exec,
+    state_done,
     state_err,
 };
 
@@ -121,18 +125,27 @@ enum pr_cmd {
     cmd_inquiry = 0x0f,
 };
 
-struct pr_data {
+enum pr_owner {
+    own_isr = 0,
+    own_task,
+};
+
+struct pr_packet {
+    volatile enum pr_owner owner;
     enum pr_state state;
     uint8_t cmd;
     uint8_t compr;
-    uint8_t buff[MAX_DATA_SIZE];
-    size_t buff_len;
-    uint8_t data[IMG_SIZE];
+    uint8_t data[MAX_DATA_SIZE];
     size_t data_len;
-    uint8_t params[PR_PARAM_SIZE];
     size_t cur_len;
     uint16_t cur_sum;
     uint16_t chk_sum;
+};
+
+struct pr_data {
+    uint8_t data[IMG_SIZE];
+    size_t data_len;
+    uint8_t params[PR_PARAM_SIZE];
     uint8_t status;
     unsigned int busy_cnt;
     unsigned int printed;
@@ -141,14 +154,21 @@ struct pr_data {
 };
 
 static struct spi_ctrl {
-    volatile uint8_t rcv_data;
-    volatile uint8_t snd_data;
-    volatile unsigned int clk_cnt;
-    xQueueHandle byte_done;
+    struct pr_packet work_packet;
+    struct pr_packet packets[PKT_RING_SIZE];
+    size_t clk_cnt;
+    uint64_t clk_last;
+    uint8_t rcv_data;
+    uint8_t snd_data;
+    volatile size_t wr_idx;
+    volatile size_t rd_idx;
+    volatile uint8_t status_isr;
+    volatile uint8_t status_task;
+    xQueueHandle packet_done;
 } ctrl;
 
 static uint8_t render_buff[IMG_SIZE];
-static QueueHandle_t packet_queue;
+static QueueHandle_t img_queue;
 static EventGroupHandle_t wifi_event_group;
 static char conn_mem[sizeof(RtosConnType) * MAX_CONNECTIONS];
 static HttpdFreertosInstance httpd_instance;
@@ -168,43 +188,6 @@ HttpdBuiltInUrl builtin_urls[]={
     ROUTE_END()
 };
 
-static void IRAM_ATTR sclk_isr_handler(void* arg)
-{
-    struct spi_ctrl *ctrl;
-    BaseType_t task_woken = false;
-
-    ctrl = (struct spi_ctrl *) arg;
-    if(gpio_get_level(GPIO_SCLK) == 0){
-        // Falling edge. Set up MISO.
-        if(ctrl->snd_data & (1u << (7 - ctrl->clk_cnt))){
-            gpio_set_level(GPIO_MISO, 1);
-        } else {
-            gpio_set_level(GPIO_MISO, 0);
-        }
-    } else {
-        // Rising edge. Sample MOSI and increase clock count.
-        if(ctrl->clk_cnt == 0){
-            ctrl->rcv_data = 0;
-        }
-
-        if(gpio_get_level(GPIO_MOSI)){
-            ctrl->rcv_data |= (1u << (7 - ctrl->clk_cnt));
-        }
-
-        ++(ctrl->clk_cnt);
-
-        // Wake up data processing task on byte boundary and reset clock
-        // counter.
-        if(ctrl->clk_cnt >= 8){
-            xSemaphoreGiveFromISR(ctrl->byte_done, &task_woken);
-            ctrl->clk_cnt = 0;
-        }
-    }
-
-    if(task_woken){
-        portYIELD_FROM_ISR();
-    }
-}
 
 CgiStatus tpl_index(HttpdConnData *conn, char *token, void **arg)
 {
@@ -412,7 +395,7 @@ esp_err_t draw_bitmap(struct pr_data *data)
     w = IMG_WIDTH;
     h = (data->data_len * 4) / IMG_WIDTH;
 
-    if(h > IMG_HIGHT){
+    if(h > IMG_HEIGHT){
         ESP_LOGE(TAG, "[%s] Invalid image hight: %d", __func__, h);
         result = ESP_ERR_INVALID_SIZE;
         goto err_out;
@@ -465,7 +448,7 @@ void save_data(struct pr_data *data)
     state.info_raw.bitdepth = 2;
     state.info_png.color.colortype = LCT_GREY;
     state.info_png.color.bitdepth = 2;
-    state.encoder.zlibsettings.btype = 0;
+    state.encoder.zlibsettings.btype = 0; // disable compression due to lack of memory
 
     lodepng_encode(&png, &png_size, data->data, data->width, data->hight, &state);
     result = state.error;
@@ -482,12 +465,14 @@ void save_data(struct pr_data *data)
         idx = 0;
     }
 
+    /* Find first free image name. Start at index read from NVS and increment
+     * until we find a free slot. */
     errno = 0;
     do{
         snprintf(path, sizeof(path) - 1, IMGDIR "/" IMGTMPL, idx);
         result = stat(path, &statbuf);
         if(result == 0){
-            ESP_LOGI(TAG, "[%s] Found %s", __func__, path);
+            ESP_LOGD(TAG, "[%s] Found %s", __func__, path);
             ++idx;
         }
     }while(result == 0);
@@ -612,200 +597,300 @@ void wifi_init_softap()
 
 }
 
+static void IRAM_ATTR sclk_isr_handler(void* arg)
+{
+    struct spi_ctrl *ctrl;
+    struct pr_packet *packet;
+    uint64_t curr_time;
+    BaseType_t task_woken;
+
+    ctrl = (struct spi_ctrl *) arg;
+    packet = &(ctrl->work_packet);
+
+    if(gpio_get_level(GPIO_SCLK) == 0){
+        // Falling edge. Set up MISO.
+        curr_time = esp_timer_get_time();
+        // Check for sync loss while receiving/sending byte
+        if(unlikely(ctrl->clk_cnt != 0 && (curr_time - ctrl->clk_last) > 200)){
+            ctrl->clk_cnt = 0;
+            ctrl->rcv_data = 0;
+            ctrl->snd_data = 0;
+        }
+
+        /* */
+        if(unlikely(   packet->state != state_sync0
+                    && (curr_time - ctrl->clk_last) > 5100))
+        {
+            packet->state = state_sync0;
+        }
+
+        ctrl->clk_last = curr_time;
+
+        gpio_set_level(GPIO_MISO, (ctrl->snd_data & 0x80u) ? 1 : 0);
+        ctrl->snd_data <<= 1;
+    } else {
+        // Rising edge. Sample MOSI and increase clock count.
+        if(unlikely(ctrl->clk_cnt == 0)){
+            ctrl->rcv_data = 0;
+        }
+
+        ctrl->rcv_data <<= 1;
+        if(gpio_get_level(GPIO_MOSI)){
+            ctrl->rcv_data |= 1;
+        }
+
+        ++ctrl->clk_cnt;
+    }
+
+    if(likely(ctrl->clk_cnt <= 7)){
+        goto done;
+    }
+
+    ctrl->clk_cnt = 0;
+
+    if(unlikely(packet->state == state_done)){
+        packet->state = state_sync0;
+    }
+
+    if(packet->state >= state_cmd && packet->state < state_chk_low){
+        packet->cur_sum += ctrl->rcv_data;
+    }
+
+    switch(packet->state){
+    case state_sync0:
+        if(ctrl->rcv_data == 0x88){
+            packet->cur_sum = 0;
+            packet->data_len = 0;
+            ctrl->status_isr = 0;
+            packet->state = state_sync1;
+        }
+        break;
+    case state_sync1:
+        if(ctrl->rcv_data == 0x33){
+            packet->state = state_cmd;
+        } else {
+            packet->state = state_sync0;
+        }
+        break;
+    case state_cmd:
+        packet->cmd = ctrl->rcv_data;
+        packet->state = state_compr;
+        break;
+    case state_compr:
+        packet->compr = ctrl->rcv_data;
+        packet->state = state_len_low;
+        break;
+    case state_len_low:
+        packet->cur_len = ctrl->rcv_data;
+        packet->state = state_len_high;
+        break;
+    case state_len_high:
+        packet->cur_len |= (ctrl->rcv_data << 8);
+
+        if(likely(packet->cur_len <= sizeof(packet->data))){
+            if(packet->cur_len > 0){
+                packet->state = state_data;
+            } else {
+                packet->state = state_chk_low;
+            }
+        } else {
+            /* Bogus data length. We could try inferring the real length
+             * from the command byte, but since we probably have lost
+             * synchronisation anyway, we just give up on this packet */
+            packet->state = state_sync0;
+        }
+        break;
+    case state_data:
+        packet->data[packet->data_len++] = ctrl->rcv_data;
+        --packet->cur_len;
+
+        if(unlikely(packet->cur_len == 0)){
+            packet->state = state_chk_low;
+        }
+        break;
+    case state_chk_low:
+        packet->chk_sum = ctrl->rcv_data;
+        packet->state = state_chk_high;
+        break;
+    case state_chk_high:
+        packet->chk_sum |= (ctrl->rcv_data << 8);
+
+        /* We need to send the ACK byte next. */
+        ctrl->snd_data = 0x81;
+
+        packet->state = state_ack;
+        break;
+    case state_ack:
+        if(unlikely(packet->chk_sum != packet->cur_sum)){
+            ctrl->status_isr |= (STATUS_CHKSUM | STATUS_ERR0);
+        } else {
+            switch(packet->cmd){
+            case cmd_data:
+                /* We expect to always receive complete bands (20 tiles)
+                 * of image data.  */
+                if(packet->data_len % 40 == 0)
+                {
+                    ctrl->status_isr |= STATUS_UNPROC;
+                } else {
+                    ctrl->status_isr |= STATUS_ERR0;
+                }
+                break;
+            case cmd_print:
+                if(packet->data_len == PR_PARAM_SIZE){
+                    ctrl->status_isr &= ~STATUS_UNPROC;
+                    ctrl->status_isr |= STATUS_FULL;
+                } else {
+                    ctrl->status_isr |= STATUS_ERR0;
+                }
+                break;
+            case cmd_inquiry:
+            case cmd_init:
+            case cmd_break:
+                break;
+            }
+            if(ctrl->packets[ctrl->wr_idx].owner == own_isr){
+                memcpy(&(ctrl->packets[ctrl->wr_idx]), packet, sizeof(*packet));
+            } else {
+                ctrl->status_isr |= STATUS_BUSY;
+            }
+        }
+ 
+        ctrl->snd_data = (ctrl->status_isr | ctrl->status_task);
+        packet->state = state_status;
+        break;
+    case state_status:
+        ctrl->snd_data = 0;
+        packet->state = state_done;
+        break;
+    default:
+        packet->state = state_sync0;
+        break;
+    }
+
+    if(   unlikely(packet->state == state_done)
+       && likely((ctrl->status_isr & (STATUS_ERR0 | STATUS_BUSY)) == 0))
+    {
+        asm volatile ("" : : : "memory");
+        ctrl->packets[ctrl->wr_idx].owner = own_task;
+        asm volatile ("" : : : "memory");
+
+        xSemaphoreGiveFromISR(ctrl->packet_done, &task_woken);
+        if(task_woken){
+            portYIELD_FROM_ISR();
+        }
+
+        ++ctrl->wr_idx;
+        ctrl->wr_idx %= ARRAY_SIZE(ctrl->packets);
+        ctrl->status_isr = 0;
+    }
+
+done:
+    return;
+}
+
 void IRAM_ATTR packet_proto_task(void *pvParameters)
 {
-    uint8_t rcv_data;
-    struct pr_data *packet = NULL;
+    struct pr_packet *packet;
+    struct pr_data *data = NULL;
 
     ESP_LOGI(TAG, "Packet proto task started");
     while(1) {
-        if(packet == NULL){
-            packet = calloc(1, sizeof(*packet));
-            if(packet == NULL){
+        packet = &(ctrl.packets[ctrl.rd_idx]);
+        if(packet->owner == own_isr){
+            xSemaphoreTake(ctrl.packet_done, 10 * portTICK_PERIOD_MS);
+        }
+        
+        if(data == NULL){
+            data = calloc(1, sizeof(*data));
+            if(data == NULL){
                 ESP_LOGE(TAG, "Out of memory");
-                goto err_out;
+                ctrl.status_task = STATUS_BUSY;
+                continue;
             }
-
-            packet->state = state_ready;
         }
 
-        if(xSemaphoreTake(ctrl.byte_done, 10 * portTICK_PERIOD_MS) != pdTRUE){
-            ctrl.clk_cnt = 0;
-            if(packet->state > state_sync1){
-                memset(packet, 0x0, sizeof(*packet));
-                ESP_LOGW(TAG, "Timeout during transfer");
+        if(data->busy_cnt >= 5){
+            memset(data, 0x0, sizeof(*data));
+            ctrl.status_task |= STATUS_ERR0;
+        }
+
+        if(data->printed != 0){
+            if(xQueueSend(img_queue, &data, 0) != pdTRUE){
+                ctrl.status_task |= STATUS_BUSY;
+                ++data->busy_cnt;
+            } else {
+                data = NULL;
+                ctrl.status_task &= ~STATUS_BUSY;
+                continue;
             }
+        }
+        
+        if(packet->owner == own_isr){
             continue;
         }
 
-        rcv_data = ctrl.rcv_data;
-        ctrl.snd_data = 0;
+        ESP_LOGD(TAG, "Got packet: cmd: 0x%02x status_isr: 0x%02x status_task: 0x%02x",
+                  packet->cmd, ctrl.status_isr, ctrl.status_task);
+        switch(packet->cmd){
+        case cmd_data:
+            ESP_LOGD(TAG, "cmd_data: len: 0x%x", packet->data_len);
+            /* We expect to always receive complete bands (20 tiles)
+             * of image data.  */
+            if(   (data->printed == 0)
+               && (packet->data_len % 40 == 0)
+               && (data->data_len + packet->data_len <= sizeof(data->data)))
+            {
+                memcpy(&(data->data[data->data_len]),
+                       packet->data,
+                       packet->data_len);
 
-        switch(packet->state){
-        case state_ready:
-            if(rcv_data == 0x88){
-                packet->state = state_sync0;
-                packet->cur_sum = 0;
-                packet->buff_len = 0;
-                packet->status &= ~STATUS_CHKSUM;
-            }
-            break;
-        case state_sync0:
-            if(rcv_data == 0x33){
-                packet->state = state_sync1;
+                data->data_len += packet->data_len;
+                ctrl.status_task |= STATUS_UNPROC;
             } else {
-                packet->state = state_ready;
+                ESP_LOGE(TAG, "Invalid data buffer length: 0x%x",
+                         packet->data_len);
+
+               ctrl.status_task |= STATUS_ERR0;
             }
             break;
-        case state_sync1:
-            packet->cmd = rcv_data;
-            packet->state = state_cmd;
-            break;
-        case state_cmd:
-            packet->compr = rcv_data;
-            packet->state = state_compr;
-            break;
-        case state_compr:
-            packet->cur_len = rcv_data;
-            packet->state = state_len_low;
-            break;
-        case state_len_low:
-            packet->cur_len |= (rcv_data << 8);
-
-            if(packet->cur_len <= sizeof(packet->buff)){
-                packet->state = state_len_high;
+        case cmd_print:
+            ESP_LOGD(TAG, "cmd_print: len: 0x%x", packet->data_len);
+            if(packet->data_len == sizeof(data->params)){
+                memcpy(data->params, packet->data, packet->data_len);
+                ctrl.status_task &= ~STATUS_UNPROC;
+                ctrl.status_task |= STATUS_FULL;
+                data->busy_cnt = 0;
+                data->printed = 1;
             } else {
-                ESP_LOGE(TAG, "Data segment too big");
-                /* Bogus data length. We could try inferring the real length
-                 * from the command byte, but since we probably have lost
-                 * synchronisation anyway, we just give up on this packet */
-                packet->state = state_err;
+                ESP_LOGE(TAG, "Parameter buffer overrun");
+                ctrl.status_task |= STATUS_ERR0;
             }
             break;
-        case state_len_high:
-            if(packet->cur_len > 0){
-                packet->buff[packet->buff_len++] = rcv_data;
-                --packet->cur_len;
-            } else {
-                packet->chk_sum = rcv_data;
-                packet->state = state_chk_low;
-            }
+        case cmd_inquiry:
+            ESP_LOGD(TAG, "cmd_inquiry: len: 0x%x", packet->data_len);
             break;
-        case state_chk_low:
-            packet->chk_sum |= (rcv_data << 8);
-            packet->state = state_chk_high;
-
-            /* We need to send the ACK byte next. */
-            ctrl.snd_data = 0x81;
-            break;
-        case state_chk_high:
-            packet->state = state_ack;
-            break;
-        case state_ack:
-            packet->state = state_status;
-            break;
-        case state_status:
-            /* Should never be reached, transition status->ready is handled
-             * down below. */
-            /* no break */
-        default:
-            ESP_LOGE(TAG, "Illegal state: 0x%x", packet->state);
-            packet->state = state_err;
+        case cmd_init:
+        case cmd_break:
+            ESP_LOGD(TAG, "cmd_init/break");
+            memset(data, 0x0, sizeof(*data));
+            ctrl.status_task = 0;
             break;
         }
 
-        if(packet->state == state_err){
-            ESP_LOGE(TAG, "Entered error state, resetting packet");
-            memset(packet, 0x0, sizeof(*packet));
-            ctrl.snd_data = packet->status;
-            continue;
-        }
+        asm volatile ("" : : : "memory");
+        packet->owner = own_isr;
+        asm volatile ("" : : : "memory");
 
-        if(packet->state >= state_cmd && packet->state < state_chk_low){
-            packet->cur_sum += rcv_data;
-        }
-
-        if(packet->state == state_ack){
-            if(packet->chk_sum != packet->cur_sum){
-                ESP_LOGE(TAG, "Checksum mismatch: expected: 0x%x calc: 0x%x",
-                         packet->chk_sum, packet->cur_sum);
-
-                packet->status |= STATUS_CHKSUM;
-                packet->status |= STATUS_ERR0;
-            } else {
-                switch(packet->cmd){
-                case cmd_data:
-                    /* We expect to always receive complete bands (20 tiles)
-                     * of image data.  */
-                    if(   (packet->buff_len % 40 == 0)
-                       && (packet->data_len + packet->buff_len
-                             <= sizeof(packet->data)))
-                    {
-                        memcpy(&(packet->data[packet->data_len]),
-                               packet->buff,
-                               packet->buff_len);
-
-                        packet->data_len += packet->buff_len;
-                        packet->status |= STATUS_UNPROC;
-                    } else {
-                        ESP_LOGE(TAG, "Invalid data buffer length: 0x%x",
-                                 packet->buff_len);
-
-                        packet->status |= STATUS_ERR0;
-                    }
-                    break;
-                case cmd_print:
-                    if(packet->buff_len == sizeof(packet->params)){
-                        memcpy(packet->params, packet->buff, packet->buff_len);
-                        packet->status &= ~STATUS_UNPROC;
-                        packet->status |= STATUS_FULL;
-                        packet->printed = 1;
-                    } else {
-                        ESP_LOGE(TAG, "Parameter buffer overrun");
-                        packet->status |= STATUS_ERR0;
-                    }
-                    break;
-                case cmd_inquiry:
-                    break;
-                case cmd_init:
-                case cmd_break:
-                    memset(packet, 0x0, sizeof(*packet));
-                    break;
-                }
-            }
-
-            ctrl.snd_data = packet->status;
-        }
-
-        if(packet->state == state_status){
-            if(packet->busy_cnt > 5){
-                memset(packet, 0x0, sizeof(*packet));
-            }
-
-            packet->state = state_ready;
-
-            if(packet->printed != 0){
-                if(xQueueSend(packet_queue, &packet, 0) != pdTRUE){
-                    packet->status |= STATUS_BUSY;
-                    ++packet->busy_cnt;
-                } else {
-                    packet = NULL;
-                }
-            }
-        }
+        ++ctrl.rd_idx;
+        ctrl.rd_idx %= ARRAY_SIZE(ctrl.packets);
     }
-
-err_out:
-    ESP_LOGE(TAG, "[%s] Entered error state", __func__);
-    while(1)
-        ;
 }
 
 void app_main()
 {
     esp_err_t result;
     gpio_config_t io_cfg;
-    struct pr_data *packet = NULL;
+    struct pr_data *data = NULL;
 
     // Initialise NVS
     result = nvs_flash_init();
@@ -816,6 +901,8 @@ void app_main()
         result = nvs_flash_init();
     }
     ESP_ERROR_CHECK(result);
+
+    memset(&ctrl, 0x0, sizeof(ctrl));
 
     memset(&io_cfg, 0x0, sizeof(io_cfg));
     io_cfg.intr_type = GPIO_INTR_ANYEDGE;
@@ -852,8 +939,8 @@ void app_main()
     }
 
     memset(&ctrl, 0x0, sizeof(ctrl));
-    ctrl.byte_done = xSemaphoreCreateBinary();
-    if(ctrl.byte_done == NULL){
+    ctrl.packet_done = xSemaphoreCreateBinary();
+    if(ctrl.packet_done == NULL){
         ESP_LOGE(TAG, "xSemaphoreCreateBinary() failed");
         goto err_out;
     }
@@ -876,8 +963,8 @@ void app_main()
         goto err_out;
     }
 
-    packet_queue = xQueueCreate(2, sizeof(struct pr_data *));
-    if(packet_queue == NULL){
+    img_queue = xQueueCreate(2, sizeof(struct pr_data *));
+    if(img_queue == NULL){
         ESP_LOGE(TAG, "[%s] Creating packet queue failed.", __func__);
         goto err_out;
     }
@@ -891,9 +978,9 @@ void app_main()
 
     ESP_LOGI(TAG, "Entering main loop");
     while(1){
-        if(xQueueReceive(packet_queue, &packet, portMAX_DELAY) == pdTRUE){
-            save_data(packet);
-            free(packet);
+        if(xQueueReceive(img_queue, &data, portMAX_DELAY) == pdTRUE){
+            save_data(data);
+            free(data);
         }
     }
 
