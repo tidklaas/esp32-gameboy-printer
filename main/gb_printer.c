@@ -88,6 +88,15 @@
 #define PR_PARAM_SIZE   4
 #define PKT_RING_SIZE   4
 
+#define HTML_HEADER     "<html>" \
+                        "<head>" \
+                        "<meta charset=\"utf-8\">" \
+                            "<title>ESP32 GameBoy Printer</title>" \
+                            "<link rel=\"stylesheet\" href=\"style.css\" " \
+                                "media=\"screen\" title=\"no title\" " \
+                                "charset=\"utf-8\">" \
+                        "</head>"
+
 #define ARRAY_SIZE(x)   (sizeof(x) / sizeof(*(x)))
 #define likely(x)       __builtin_expect((x),1)
 #define unlikely(x)     __builtin_expect((x),0)
@@ -268,15 +277,11 @@ CgiStatus cgi_del_all(HttpdConnData *conn)
         goto err_out;
     }
 
-    httpdStartResponse(conn, 200);
-    httpdHeader(conn, "Content-Type", "text/json");
-    httpdEndHeaders(conn);
-
     dir = opendir(IMGDIR);
     if(dir == NULL){
         ESP_LOGE(TAG, "[%s] opendir() failed", __func__);
         result = -1;
-        goto send_data;
+        goto send_reply;
     }
 
     while((ent = readdir(dir)) != NULL){
@@ -284,13 +289,32 @@ CgiStatus cgi_del_all(HttpdConnData *conn)
         result = unlink(buff);
         if(result != 0){
             ESP_LOGE(TAG, "[%s] Unlink failed for %s", __func__, buff);
-            goto send_data;
+            goto send_reply;
         }
     }
 
-send_data:
-    snprintf(buff, sizeof(buff), "%s", result == 0 ? "true" : "false");
-    httpdSend(conn, buff, -1);
+send_reply:
+    if(result == 0){
+        httpdRedirect(conn, "/index.tpl");
+    } else {
+        httpdStartResponse(conn, 500);
+        httpdHeader(conn, "Content-Type", "text/html");
+        httpdEndHeaders(conn);
+
+        httpdSend(conn, HTML_HEADER, -1);
+        httpdSend(conn, "<body>"
+                            "<h1>ESP32 Gameboy Printer</h1>"
+                            "<p>"
+                                "Error while deleting file ", -1);
+        httpdSend(conn, buff, -1);
+        httpdSend(conn,     ".<br>"
+                            "<a href=\"/index.tpl\">Go back</a>"
+                            "<br>"
+                            "<a href=\"/remove_all\">Retry</a>"
+                        "</p>"
+                        "</body>"
+                        "</html>", -1);
+    }
 
 err_out:
     if(dir != NULL){
@@ -302,11 +326,9 @@ err_out:
 
 CgiStatus cgi_reset_seq(HttpdConnData *conn)
 {
-    char buff[128];
     nvs_handle handle;
     int result;
 
-    buff[0] = '\0';
     result = 0;
 
     if(conn->isConnectionClosed){
@@ -323,15 +345,28 @@ CgiStatus cgi_reset_seq(HttpdConnData *conn)
     nvs_close(handle);
 
 send_reply:
-    httpdStartResponse(conn, 200);
-    httpdHeader(conn, "Content-Type", "text/json");
-    httpdEndHeaders(conn);
+    if(result == ESP_OK){
+        httpdRedirect(conn, "/index.tpl");
+    } else {
+        httpdStartResponse(conn, 500);
+        httpdHeader(conn, "Content-Type", "text/html");
+        httpdEndHeaders(conn);
 
-    snprintf(buff, sizeof(buff), "%s", result == ESP_OK ? "true" : "false");
-    httpdSend(conn, buff, -1);
+        httpdSend(conn, HTML_HEADER, -1);
+        httpdSend(conn, "<body>"
+                            "<h1>ESP32 Gameboy Printer</h1>"
+                            "<p>"
+                                "Error resetting image sequence."
+                                "<br>"
+                                "<a href=\"/index.tpl\">Go back</a>"
+                                "<br>"
+                                "<a href=\"/reset_seq\">Retry</a>"
+                            "</p>"
+                        "</body>"
+                        "</html>", -1);
+    }
 
 err_out:
-
     return HTTPD_CGI_DONE;
 }
 
@@ -355,8 +390,8 @@ esp_err_t http_srv_init(void)
 	                           HTTPD_FLAG_NONE);
 
     if(status != InitializationSuccess){
-       result = ESP_FAIL;
-       goto err_out;
+        result = ESP_FAIL;
+        goto err_out;
     }
 
     httpdFreertosStart(&httpd_instance);
@@ -386,7 +421,7 @@ void draw_tile(uint8_t *data, uint8_t *image)
 esp_err_t draw_bitmap(struct pr_data *data)
 {
     size_t w, h, x, y;
-    uint8_t *tile_data, *tile_image;
+    uint8_t *tile_data, *tile_dest;
     unsigned int tile;
     esp_err_t result;
 
@@ -408,8 +443,8 @@ esp_err_t draw_bitmap(struct pr_data *data)
         y = 8 * (tile / 20);
 
         tile_data = &(data->data[tile * 16]);
-        tile_image = &(render_buff[(x * 2) + (y * 40)]);
-        draw_tile(tile_data, tile_image);
+        tile_dest = &(render_buff[(x * 2) + (y * 40)]);
+        draw_tile(tile_data, tile_dest);
     }
 
     memmove(data->data, render_buff, data->data_len);
