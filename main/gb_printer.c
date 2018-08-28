@@ -97,9 +97,11 @@
                                 "charset=\"utf-8\">" \
                         "</head>"
 
+/* Useful Linux-like defines */
 #define ARRAY_SIZE(x)   (sizeof(x) / sizeof(*(x)))
 #define likely(x)       __builtin_expect((x),1)
 #define unlikely(x)     __builtin_expect((x),0)
+#define mb()            asm volatile ("" : : : "memory")
 
 #define STATUS_CHKSUM   (1u << 0)
 #define STATUS_BUSY     (1u << 1)
@@ -122,8 +124,6 @@ enum pr_state {
     state_chk_high,
     state_ack,
     state_status,
-    state_done,
-    state_err,
 };
 
 enum pr_cmd {
@@ -643,19 +643,27 @@ static void IRAM_ATTR sclk_isr_handler(void* arg)
     packet = &(ctrl->work_packet);
 
     if(gpio_get_level(GPIO_SCLK) == 0){
-        // Falling edge. Set up MISO.
+        /* Falling edge. Check timeouts and set up MISO. */
+
         curr_time = esp_timer_get_time();
-        // Check for sync loss while receiving/sending byte
+
+        /* Check for sync loss during byte transfer. Clock should run  */
+        /* at ~8kHz (125us), so anything above 200us is definitely out */
+        /* of spec.                                                    */
         if(unlikely(ctrl->clk_cnt != 0 && (curr_time - ctrl->clk_last) > 200)){
             ctrl->clk_cnt = 0;
             ctrl->rcv_data = 0;
             ctrl->snd_data = 0;
+            ctrl->status_isr |= STATUS_ERR0;
+            packet->state = state_sync0;
         }
 
-        /* */
-        if(unlikely(   packet->state != state_sync0
+        /* According to the Game Boy programming manual the maximum allowed */
+        /* pause between sending bytes in a packet is 5ms. */
+        if(unlikely(packet->state != state_sync0
                     && (curr_time - ctrl->clk_last) > 5100))
         {
+            ctrl->status_isr |= STATUS_ERR0;
             packet->state = state_sync0;
         }
 
@@ -683,20 +691,21 @@ static void IRAM_ATTR sclk_isr_handler(void* arg)
 
     ctrl->clk_cnt = 0;
 
-    if(unlikely(packet->state == state_done)){
-        packet->state = state_sync0;
-    }
-
     if(packet->state >= state_cmd && packet->state < state_chk_low){
         packet->cur_sum += ctrl->rcv_data;
     }
 
+    /* Process the transferred byte. The state indicates how the byte that */
+    /* has just completed is interpreted. If data needs to be sent out in  */
+    /* state x, it must be copied to ctrl->snd_data during transition to   */
+    /* that state.                                                         */
     switch(packet->state){
     case state_sync0:
         if(ctrl->rcv_data == 0x88){
             packet->cur_sum = 0;
             packet->data_len = 0;
-            ctrl->status_isr = 0;
+            ctrl->status_isr &= ~(STATUS_CHKSUM | STATUS_BUSY);
+
             packet->state = state_sync1;
         }
         break;
@@ -705,6 +714,7 @@ static void IRAM_ATTR sclk_isr_handler(void* arg)
             packet->state = state_cmd;
         } else {
             packet->state = state_sync0;
+            ctrl->status_isr |= STATUS_ERR0;
         }
         break;
     case state_cmd:
@@ -733,6 +743,7 @@ static void IRAM_ATTR sclk_isr_handler(void* arg)
              * from the command byte, but since we probably have lost
              * synchronisation anyway, we just give up on this packet */
             packet->state = state_sync0;
+            ctrl->status_isr |= STATUS_ERR0;
         }
         break;
     case state_data:
@@ -756,13 +767,18 @@ static void IRAM_ATTR sclk_isr_handler(void* arg)
         packet->state = state_ack;
         break;
     case state_ack:
+        /* Packet is almost complete, we need to send out the checksum */
+        /* in the next byte. Check for errors and update ISR status    */
+        /* accordingly. If everything checks out, try copying packet   */
+        /* to transfer ring.                                           */
+
         if(unlikely(packet->chk_sum != packet->cur_sum)){
             ctrl->status_isr |= (STATUS_CHKSUM | STATUS_ERR0);
         } else {
             switch(packet->cmd){
             case cmd_data:
-                /* We expect to always receive complete bands (20 tiles)
-                 * of image data.  */
+                /* We expect to always receive complete bands (20 tiles) */
+                /* of image data.                                        */
                 if(packet->data_len % 40 == 0)
                 {
                     ctrl->status_isr |= STATUS_UNPROC;
@@ -779,44 +795,53 @@ static void IRAM_ATTR sclk_isr_handler(void* arg)
                 }
                 break;
             case cmd_inquiry:
+                break;
             case cmd_init:
             case cmd_break:
+                ctrl->status_isr = 0;
                 break;
             }
+
             if(ctrl->packets[ctrl->wr_idx].owner == own_isr){
                 memcpy(&(ctrl->packets[ctrl->wr_idx]), packet, sizeof(*packet));
             } else {
-                ctrl->status_isr |= STATUS_BUSY;
+                /* Protocol task is too slow, signal busy error. */
+                ctrl->status_isr |= (STATUS_ERR0 | STATUS_BUSY);
             }
         }
  
+        /* Send combined error status of ISR and task */
         ctrl->snd_data = (ctrl->status_isr | ctrl->status_task);
+
         packet->state = state_status;
         break;
     case state_status:
-        ctrl->snd_data = 0;
-        packet->state = state_done;
-        break;
-    default:
-        packet->state = state_sync0;
-        break;
-    }
+        /* Status byte has been sent out, packet transfer is complete. */
+        /* Hand packet over to protocol task, unless we had a checksum */
+        /* error or packet ring was full.                              */
+        if(likely((ctrl->status_isr & (STATUS_CHKSUM | STATUS_BUSY)) == 0)){
+            mb();
+            ctrl->packets[ctrl->wr_idx].owner = own_task;
+            mb();
 
-    if(   unlikely(packet->state == state_done)
-       && likely((ctrl->status_isr & (STATUS_ERR0 | STATUS_BUSY)) == 0))
-    {
-        asm volatile ("" : : : "memory");
-        ctrl->packets[ctrl->wr_idx].owner = own_task;
-        asm volatile ("" : : : "memory");
+            xSemaphoreGiveFromISR(ctrl->packet_done, &task_woken);
+            if(task_woken){
+                portYIELD_FROM_ISR();
+            }
 
-        xSemaphoreGiveFromISR(ctrl->packet_done, &task_woken);
-        if(task_woken){
-            portYIELD_FROM_ISR();
+            ++ctrl->wr_idx;
+            ctrl->wr_idx %= ARRAY_SIZE(ctrl->packets);
         }
 
-        ++ctrl->wr_idx;
-        ctrl->wr_idx %= ARRAY_SIZE(ctrl->packets);
-        ctrl->status_isr = 0;
+        /* Get ready to start reception of next packet */
+        packet->state = state_sync0;
+        ctrl->snd_data = 0;
+        break;
+    default:
+        /* Should never be reached. */
+        packet->state = state_sync0;
+        ctrl->status_isr |= STATUS_ERR0;
+        break;
     }
 
 done:
@@ -828,13 +853,12 @@ void IRAM_ATTR packet_proto_task(void *pvParameters)
     struct pr_packet *packet;
     struct pr_data *data = NULL;
 
-    ESP_LOGI(TAG, "Packet proto task started");
+    ESP_LOGI(TAG, "Packet proto task started.");
+
     while(1) {
-        packet = &(ctrl.packets[ctrl.rd_idx]);
-        if(packet->owner == own_isr){
-            xSemaphoreTake(ctrl.packet_done, 10 * portTICK_PERIOD_MS);
-        }
-        
+        /* Make sure we have an image data buffer ready before we accept */
+        /* any command packages from the ISR.                            */
+
         if(data == NULL){
             data = calloc(1, sizeof(*data));
             if(data == NULL){
@@ -844,35 +868,58 @@ void IRAM_ATTR packet_proto_task(void *pvParameters)
             }
         }
 
-        if(data->busy_cnt >= 5){
-            memset(data, 0x0, sizeof(*data));
-            ctrl.status_task |= STATUS_ERR0;
-        }
-
+        /* If we have a completed image buffer, try handing it to the main */
+        /* task for rendering and saving to flash.                         */
         if(data->printed != 0){
             if(xQueueSend(img_queue, &data, 0) != pdTRUE){
                 ctrl.status_task |= STATUS_BUSY;
                 ++data->busy_cnt;
+
+                if(data->busy_cnt < 5){
+                    /* Give main task a chance to process the queue. */
+                    vTaskDelay(portTICK_PERIOD_MS);
+                } else {
+                    /* Give up and signal an error after five tries. */
+                    memset(data, 0x0, sizeof(*data));
+                    ctrl.status_task |= STATUS_ERR0;
+                }
             } else {
+                /* Data buffer belongs to main task now. We will allocate */
+                /* a new one on next loop iteration.                      */
                 data = NULL;
                 ctrl.status_task &= ~STATUS_BUSY;
-                continue;
             }
+
+            /* Restart loop for either retrying this buffer or allocating */
+            /* a new one.                                                 */
+            continue;
         }
-        
+
+        /* We have a non-completed data buffer now. Remove busy signal and */
+        /* wait for command packet from ISR.                               */
+        ctrl.status_task &= ~STATUS_BUSY;
+
+        packet = &(ctrl.packets[ctrl.rd_idx]);
+        if(packet->owner == own_isr){
+            xSemaphoreTake(ctrl.packet_done, portMAX_DELAY);
+        }
+
+        /* No new packet availabe? Restart loop. */
         if(packet->owner == own_isr){
             continue;
         }
 
         ESP_LOGD(TAG, "Got packet: cmd: 0x%02x status_isr: 0x%02x status_task: 0x%02x",
                   packet->cmd, ctrl.status_isr, ctrl.status_task);
+
         switch(packet->cmd){
         case cmd_data:
+            /* We expect to always receive complete bands (20 tiles)  */
+            /* of image data. Copy data payload into the image buffer */
+            /* and update the current offset.                         */
+
             ESP_LOGD(TAG, "cmd_data: len: 0x%x", packet->data_len);
-            /* We expect to always receive complete bands (20 tiles)
-             * of image data.  */
-            if(   (data->printed == 0)
-               && (packet->data_len % 40 == 0)
+            if(   (packet->data_len % 40 == 0)
                && (data->data_len + packet->data_len <= sizeof(data->data)))
             {
                 memcpy(&(data->data[data->data_len]),
@@ -885,10 +932,13 @@ void IRAM_ATTR packet_proto_task(void *pvParameters)
                 ESP_LOGE(TAG, "Invalid data buffer length: 0x%x",
                          packet->data_len);
 
-               ctrl.status_task |= STATUS_ERR0;
+                ctrl.status_task |= STATUS_ERR0;
             }
             break;
         case cmd_print:
+            /* Image data transfer is complete. Prepare to hand data buffer */
+            /* over to main task.                                           */
+
             ESP_LOGD(TAG, "cmd_print: len: 0x%x", packet->data_len);
             if(packet->data_len == sizeof(data->params)){
                 memcpy(data->params, packet->data, packet->data_len);
@@ -902,19 +952,26 @@ void IRAM_ATTR packet_proto_task(void *pvParameters)
             }
             break;
         case cmd_inquiry:
+            /* Status inquiry is handled completely in ISR. */
+
             ESP_LOGD(TAG, "cmd_inquiry: len: 0x%x", packet->data_len);
             break;
         case cmd_init:
         case cmd_break:
+            /* Hard reset the whole transaction. This is the only way to     */
+            /* clear possible error states from the task's status indicator. */
+
             ESP_LOGD(TAG, "cmd_init/break");
             memset(data, 0x0, sizeof(*data));
             ctrl.status_task = 0;
             break;
         }
 
-        asm volatile ("" : : : "memory");
+        /* Hand ownership of command packet back to ISR, move read index */
+        /* to next element in ring.                                      */
+        mb();
         packet->owner = own_isr;
-        asm volatile ("" : : : "memory");
+        mb();
 
         ++ctrl.rd_idx;
         ctrl.rd_idx %= ARRAY_SIZE(ctrl.packets);
